@@ -1,196 +1,418 @@
-from curses import termattrs
-from unittest import TextTestResult
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import PIL
-import shutil
-import zipfile
+import argparse
 import os
 import time
-
 from glob import glob
-from tqdm import tqdm
-import logging
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import DataLoader
 from torchsummary import summary
+from torchvision import transforms
+from tqdm import tqdm
 
-#INIT Custom librarys
-from lib.dataloader import dog_cat_dataloader
+from libs.dataloader import dataset
+from libs.logger import Logger
+from models import resnet
 
-logging.basicConfig(filename='train.log',level=logging.INFO)
-
-def fit(model_name, model, criterion, optimizer, epochs, train_loader, valid_loader):
-	train_loss = 0
-	train_acc = 0
-	train_correct = 0
-	train_losses = []
-	train_accuracies = []
-	valid_losses = []
-	valid_accuracies = []
-	if not os.path.exists(model_name):
-		os.mkdir(model_name)
-	for epoch in tqdm(range(epochs)):
-		start = time.time()
-		for train_x, train_y in tqdm(train_loader):
-			model.train()
-			train_x, train_y = train_x.to(device), train_y.to(device).float()
-			optimizer.zero_grad()
-			pred = model(train_x)
-			loss = criterion(pred, train_y)
-			loss.backward()
-			optimizer.step()
-			train_loss += loss.item()
-			y_pred = pred.cpu()
-			y_pred[y_pred >= 0.5] = 1
-			y_pred[y_pred < 0.5] = 0
-			train_correct += y_pred.eq(train_y.cpu()).int().sum()
-		# validation data check
-		valid_loss = 0
-		valid_acc = 0
-		valid_correct = 0
-		for valid_x, valid_y in tqdm(valid_loader):
-			with torch.no_grad():
-				model.eval()
-				valid_x, valid_y = valid_x.to(device), valid_y.to(device).float()
-				pred = model(valid_x)
-				loss = criterion(pred, valid_y)
-				valid_loss += loss.item()
-				y_pred = pred.cpu()
-				y_pred[y_pred >= 0.5] = 1
-				y_pred[y_pred < 0.5] = 0
-				valid_correct += y_pred.eq(valid_y.cpu()).int().sum()
-				train_acc = train_correct/len(train_loader.dataset)
-				valid_acc = valid_correct/len(valid_loader.dataset)
-				print(f'{time.time() - start:.3f}sec : [Epoch {epoch+1}/{epochs}] -> train loss: {train_loss/len(train_loader):.4f}, train acc: {train_acc*100:.3f}% / valid loss: {valid_loss/len(valid_loader):.4f}, valid acc: {valid_acc*100:.3f}%')
-				train_losses.append(train_loss/len(train_loader))
-				train_accuracies.append(train_acc)
-				valid_losses.append(valid_loss/len(valid_loader))
-				valid_accuracies.append(valid_acc)
-				train_loss = 0
-				train_acc = 0
-				train_correct = 0
-		plt.plot(train_losses, label='loss')
-		plt.plot(train_accuracies, label='accuracy')
-		plt.legend()
-		plt.title('train loss and accuracy')
-		# plt.show()
-		plt.savefig(os.path.join(model_name, model_name+"_train_loss_accuracy_"+str(epoch)+".png"))
-		plt.cla()
-  
-		plt.plot(valid_losses, label='loss')
-		plt.plot(valid_accuracies, label='accuracy')
-		plt.legend()
-		plt.title('valid loss and accuracy')
-		# plt.show()
-		plt.savefig(os.path.join(model_name, model_name+"_valid_loss_accuracy_"+str(epoch)+".png"))
-		plt.cla()
-
-	torch.save(model, os.path.join(model_name, model_name+".pt"))
-
-dataset_root = './datasets/'
-train_data = os.path.join(dataset_root, "train")
-test_data = os.path.join(dataset_root, "test")
-
-dog_file = glob(os.path.join(train_data, "dog.*.jpg"))
-cat_file = glob(os.path.join(train_data, "cat.*.jpg"))
-
-_train_data = os.path.join(dataset_root, "train_data")
-_vaild_data = os.path.join(dataset_root, "vaild_data")
-
-if not os.path.exists(_train_data):
-	os.mkdir(_train_data)
-if not os.path.exists(_vaild_data):
-	os.mkdir(_vaild_data)
-
-n = 0
-for i, j in tqdm(zip(dog_file, cat_file)):
-	if n < 0.95*len(dog_file):
-		shutil.copy(i, _train_data)
-		shutil.copy(j, _train_data)
-	else:
-		shutil.copy(i, _vaild_data)
-		shutil.copy(j, _vaild_data)
-	
-	n+=1
-
-train_transform = torchvision.transforms.Compose([
-	torchvision.transforms.Resize((256, 256)),
-	torchvision.transforms.RandomCrop(224),
-	torchvision.transforms.RandomHorizontalFlip(),
-	torchvision.transforms.ToTensor(),
-])
-
-test_transform = torchvision.transforms.Compose([
-	torchvision.transforms.Resize((224,244)),
-	torchvision.transforms.ToTensor(),
-])
+sns.set(style="darkgrid", font_scale=1.2)
+logger = Logger(name="log/", save=False)
 
 
-train_dog_dataset = dog_cat_dataloader(dog_file[:10000], _train_data, transform=train_transform)
-train_cat_dataset = dog_cat_dataloader(cat_file[:10000], _train_data, transform=train_transform)
-valid_dog_dataset = dog_cat_dataloader(dog_file[10000:11250], _vaild_data, transform=test_transform)
-valid_cat_dataset = dog_cat_dataloader(cat_file[10000:11250], _vaild_data, transform=test_transform)
-test_dog_dataset = dog_cat_dataloader(dog_file[11250:], test_data, transform=test_transform)
-test_cat_dataset = dog_cat_dataloader(cat_file[11250:], test_data, transform=test_transform)
+def hyp_parser(parser):
+    parser.add_argument(
+        "--lr",
+        "--learning-rate",
+        default=1e-3,
+        type=float,
+        help="initial learning rate",
+    )
+    # parser.add_argument("--momentum", default=0.9, type=float, help="Momentum value for optim")
+    parser.add_argument(
+        "--batch_size",
+        default=32,
+        type=int,
+        help="Batch size for training",
+    )
+    parser.add_argument(
+        "--epochs",
+        default=100,
+        type=int,
+        help="Maximum epoch stop for training",
+    )
+    parser.add_argument(
+        "--stride",
+        type=int,
+        default=32,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="resnet18",
+    )
+    return parser
 
-train_dataset = torch.utils.data.ConcatDataset([train_dog_dataset, train_cat_dataset])
-valid_dataset = torch.utils.data.ConcatDataset([valid_dog_dataset, valid_cat_dataset])
-test_dataset = torch.utils.data.ConcatDataset([test_dog_dataset, test_cat_dataset])
 
-logging.info("train dataset : {}".format(len(train_dataset)))
-logging.info("valid dataset : {}".format(len(valid_dataset)))
-logging.info("test dataset : {}".format(len(test_dataset)))
+def argparses():
+    parser = argparse.ArgumentParser()
+    parser = hyp_parser(parser)
 
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=32+32+32, shuffle=True)
-valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=32+32+32, shuffle=True)
-test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=32+32+32, shuffle=True)
+    parser.add_argument(
+        "--input-size",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default="weights",
+        help="Dataset path for training",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="datasets/{your data class}",
+        help="Dataset path for training",
+    )
+    parser.add_argument(
+        "--classes",
+        type=str,
+        default="datasets/classes.txt",
+        help="Dataset class text file path",
+    )
+    args = parser.parse_args()
+
+    return args
 
 
-samples, labels = iter(train_loader).next()
-classes = {0:'cat', 1:'dog'}
-# fig = plt.figure(figsize=(16,24))
-# for i in range(24):
-# 	a = fig.add_subplot(4,6,i+1)
-# 	a.set_title(classes[labels[i].item()])
-# 	a.axis('off')
-# 	a.imshow(np.transpose(samples[i].numpy(), (1,2,0)))
-# plt.subplots_adjust(bottom=0.2, top=0.6, hspace=0)
-# plt.cla()
+def data_distribution(logger, data, classes):
+    pbar = tqdm(data)
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    name_cls = []
+    num = []
+    n = 0
+    for i in pbar:
+        for j in range(len(classes)):
+            if classes[j] in i:
+                name_cls.append(classes[j])
+        num.append(n)
+        n += 1
+        # num_cls[j].append(i)
+        pbar.set_description_str(f"{i}")
 
-model_list = [{"pre_resnet18":torchvision.models.resnet18(pretrained=True)},{"pre_resnet34":torchvision.models.resnet34(pretrained=True)}, \
-    		  {"pre_resnet50":torchvision.models.resnet50(pretrained=True)},{"pre_resnet101":torchvision.models.resnet101(pretrained=True)},{"pre_resnet152":torchvision.models.resnet152(pretrained=True)}, \
-              {"resnet18":torchvision.models.resnet18(pretrained=False)},{"resnet34":torchvision.models.resnet34(pretrained=False)}, \
-    		  {"resnet50":torchvision.models.resnet50(pretrained=False)},{"resnet101":torchvision.models.resnet101(pretrained=False)},{"resnet152":torchvision.models.resnet152(pretrained=False)}]
+    frame = zip(num, data, name_cls)
+    df = pd.DataFrame(frame, columns=["number", "path", "class"])
 
-model_names = ["pre_resnet18","pre_resnet34","pre_resnet50","pre_resnet101","pre_resnet152", \
-    		   "resnet18","resnet34","resnet50","resnet101","resnet152"]
-for model_name, init_model in zip(model_names, model_list):
-	logging.info(model_name)
-	model = init_model[model_name]
-	num_ftrs = model.fc.in_features
-	model.fc = nn.Sequential(
-		nn.Dropout(0.5),
-		nn.Linear(num_ftrs, 1024),
-		nn.Dropout(0.2),
-		nn.Linear(1024, 512),
-		nn.Dropout(0.1),
-		nn.Linear(512, 1),
-		nn.Sigmoid()
-	)
+    logger.info(f"\n{df}")
+    # sns.countplot(x="class", hue="class", data=df)
+    # plt.show()
 
-#	model.cuda()
 
-	input_dim = samples[0].numpy().shape
-	logging.info(init_model[model_name])
+def get_lr(opt):
+    for param_group in opt.param_groups:
+        return param_group["lr"]
 
-	criterion = nn.BCELoss()
-	optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
 
-	fit(model_name, model, criterion, optimizer, 100, train_loader, valid_loader)
-	
+# function to calculate metric per mini-batch
+def metric_batch(output, target):
+    pred = output.argmax(1, keepdim=True)
+    corrects = pred.eq(target.view_as(pred)).sum().item()
+    return corrects
+
+
+# function to calculate loss per mini-batch
+def loss_batch(loss_func, output, target, opt=None):
+    loss = loss_func(output, target)
+    metric_b = metric_batch(output, target)
+
+    if opt is not None:
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+
+    return loss.item(), metric_b
+
+
+# function to calculate loss and metric per epoch
+def loss_epoch(model, loss_func, dataset_dl, device, sanity_check=False, opt=None):
+    running_loss = 0.0
+    running_metric = 0.0
+    len_data = len(dataset_dl.dataset)
+
+    for xb, yb in dataset_dl:
+        xb = xb.to(device)
+        yb = yb.to(device)
+        output = model(xb)
+
+        loss_b, metric_b = loss_batch(loss_func, output, yb, opt)
+
+        running_loss += loss_b
+
+        if metric_b is not None:
+            running_metric += metric_b
+
+        if sanity_check is True:
+            break
+
+    loss = running_loss / len_data
+    metric = running_metric / len_data
+
+    return loss, metric
+
+
+def train_val(net, args, train_loader, val_loader, test_loader, device, model_name):
+    loss_func = nn.CrossEntropyLoss(reduction="sum")
+    opt = optim.Adam(net.parameters(), lr=0.001)
+
+    lr_scheduler = ReduceLROnPlateau(opt, mode="min", factor=0.1, patience=10)
+
+    loss_list = {"train": [], "val": []}
+    matric_list = {"train": [], "val": []}
+
+    pbar = tqdm(range(args.epochs))
+    best_loss = None
+    net = nn.DataParallel(net, output_device=0)
+    for epoch in pbar:
+        start = time.time()
+        lr = get_lr(opt)
+
+        net.train()
+
+        train_loss, train_matric = loss_epoch(net, loss_func, train_loader, device)
+        loss_list["train"].append(train_loss)
+        matric_list["train"].append(train_matric)
+
+        net.eval()
+
+        with torch.no_grad():
+            val_loss, val_matric = loss_epoch(net, loss_func, val_loader, device)
+
+        loss_list["val"].append(val_loss)
+        matric_list["val"].append(val_matric)
+
+        if epoch == 0:
+            best_loss = val_loss
+        elif val_loss < best_loss:
+            logger.info(f"Best loss update : {best_loss} -> {val_loss}")
+            best_loss = val_loss
+
+            os.makedirs(os.path.join(args.save, model_name), exist_ok=True)
+            infer_name = os.path.join(args.save, model_name, "infer_last.pth")
+            total_name = os.path.join(args.save, model_name, "total_last.pth")
+            resume_name = os.path.join(args.save, model_name, "resume_last.pth")
+            # inference model save
+            torch.save(net.state_dict(), infer_name)
+            # all model layout save
+            torch.save(net, total_name)
+            # resume checkpoint save
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": net.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "loss": train_loss,
+                },
+                resume_name,
+            )
+        else:
+            pass
+
+        lr_scheduler.step(val_loss)
+        end = time.time()
+        pbar.set_description_str(
+            f"Epoch : {epoch}/{args.epochs-1}, \
+            lr = {lr}, t_loss = {train_loss}, \
+            v_loss = {val_loss}, \
+            acc = {100 * val_matric}, \
+            time = {end - start}"
+        )
+
+    return net, loss_list, matric_list
+
+
+def training(args):
+    logger.info(f"{args}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    torch.manual_seed(1234)
+    if device == "cuda":
+        torch.cuda.manual_seed_all(1234)
+
+    train_list = sorted(glob(os.path.join(args.dataset, "train", "*.jpg")))
+    test_list = sorted(glob(os.path.join(args.dataset, "test", "*.jpg")))
+
+    # logger.debug(train_list)
+    # logger.debug(test_list)
+
+    classes = []
+    with open(args.classes) as f:
+        classes = f.read().splitlines()
+    logger.info(classes)
+
+    data_distribution(logger, train_list, classes)
+    train_list, val_list = train_test_split(train_list, test_size=0.2)
+
+    # data Augumentation
+    train_transforms = transforms.Compose(
+        [
+            transforms.Resize((args.input_size, args.input_size)),
+            transforms.RandomResizedCrop(args.input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]
+    )
+
+    val_transforms = transforms.Compose(
+        [
+            transforms.Resize((args.input_size, args.input_size)),
+            transforms.RandomResizedCrop(args.input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]
+    )
+
+    test_transforms = transforms.Compose(
+        [
+            transforms.Resize((args.input_size, args.input_size)),
+            transforms.RandomResizedCrop(args.input_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ]
+    )
+
+    train_data = dataset(
+        file_list=train_list,
+        classes=classes,
+        transform=train_transforms,
+    )
+    val_data = dataset(
+        file_list=val_list,
+        classes=classes,
+        transform=val_transforms,
+    )
+    test_data = dataset(
+        file_list=test_list,
+        classes=classes,
+        transform=test_transforms,
+    )
+
+    do_train_list = [
+        ["resnet152", resnet.resnet152().to(device=device), 6],
+        ["resnet101", resnet.resnet101().to(device=device), 10],
+        ["resnet50", resnet.resnet50().to(device=device), 16],
+        ["resnet34", resnet.resnet34().to(device=device), 48],
+        ["resnet18", resnet.resnet18().to(device=device), 80],
+    ]
+    for models in do_train_list:
+        train_loader = DataLoader(
+            dataset=train_data,
+            batch_size=models[2],
+            shuffle=True,
+            num_workers=args.workers,
+            persistent_workers=True,
+        )
+        test_loader = DataLoader(
+            dataset=test_data,
+            batch_size=models[2],
+            shuffle=True,
+            num_workers=args.workers,
+            persistent_workers=True,
+        )
+        val_loader = DataLoader(
+            dataset=val_data,
+            batch_size=models[2],
+            shuffle=True,
+            num_workers=args.workers,
+            persistent_workers=True,
+        )
+
+        net = models[1]
+        summary(net, (3, args.input_size, args.input_size))
+        logger.info(f"Trained model name : {models[0]}")
+        model, loss_hist, metric_hist = train_val(
+            net, args, train_loader, val_loader, test_loader, device, models[0]
+        )
+        # Train-Validation Progress
+        num_epochs = args.epochs
+        save_dir = os.path.join(args.save, models[0])
+        os.makedirs(os.path.join(args.save, models[0]), exist_ok=True)
+        # plot loss progress
+        plt.clf()
+        plt.title("Train-Val Loss")
+        plt.plot(range(1, num_epochs + 1), loss_hist["train"], label="train")
+        plt.plot(range(1, num_epochs + 1), loss_hist["val"], label="val")
+        plt.ylabel("Loss")
+        plt.xlabel("Training Epochs")
+        plt.legend()
+        plt.savefig(f'{os.path.join(save_dir, "train_val.png")}', dpi=300)
+
+        # plot accuracy progress
+        plt.clf()
+        plt.title("Train-Val Accuracy")
+        plt.plot(range(1, num_epochs + 1), metric_hist["train"], label="train")
+        plt.plot(range(1, num_epochs + 1), metric_hist["val"], label="val")
+        plt.ylabel("Accuracy")
+        plt.xlabel("Training Epochs")
+        plt.legend()
+        plt.savefig(f'{os.path.join(save_dir, "accuracy.png")}', dpi=300)
+
+    # pbar = tqdm(range(args.epochs))
+    # for epoch in pbar:
+    #     epoch_loss = 0
+    #     epoch_accuracy = 0
+    #     for data, label in train_loader:
+    #         data = data.to(device)
+    #         label = label.to(device)
+
+    #         output = model(data)
+    #         loss = criterion(output, label)
+
+    #         optimizer.zero_grad()
+    #         loss.backward()
+    #         optimizer.step()
+
+    #         acc = (output.argmax(dim=1) == label).float().mean()
+    #         epoch_accuracy += acc / len(train_loader)
+    #         epoch_loss += loss / len(train_loader)
+
+    #     pbar.set_description_str(
+    #         f"Epoch : {epoch + 1}, train accuracy : {epoch_accuracy}, train loss : {epoch_loss}"
+    #     )
+
+    #     with torch.no_grad():
+    #         epoch_val_accuracy = 0
+    #         epoch_val_loss = 0
+    #         for data, label in val_loader:
+    #             data = data.to(device)
+    #             label = label.to(device)
+
+    #             val_output = model(data)
+    #             val_loss = criterion(val_output, label)
+
+    #             acc = (val_output.argmax(dim=1) == label).float().mean()
+    #             epoch_val_accuracy += acc / len(val_loader)
+    #             epoch_val_loss += val_loss / len(val_loader)
+
+    #         pbar.set_description_str(
+    #             f"Epoch : {epoch + 1}, val accuracy : {epoch_val_accuracy}, val loss : {epoch_val_loss}"
+    #         )
+
+
+def main():
+    opt = argparses()
+    training(opt)
+
+
+if __name__ == "__main__":
+    main()

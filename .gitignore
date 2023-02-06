@@ -1,2 +1,6 @@
 datasets
 .DS_Store
+logs
+.vscode
+weights
+*.pyc

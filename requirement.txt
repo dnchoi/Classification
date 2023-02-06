@@ -1,0 +1,9 @@
+torch
+torchvision
+torchsummary
+seaborn
+tqdm
+scikit-learn
+colorlog
+matplotlib
+opencv-python
